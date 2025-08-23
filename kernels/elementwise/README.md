@@ -4,20 +4,19 @@
 
 包含以下内容：
 
-- [X] elementwise_add_f32_kernel
-- [X] elementwise_add_f32x4_kernel(float4向量化版本)
-- [X] elementwise_add_f16_kernel(fp16版本)
-- [X] elementwise_add_f16x2_kernel(fp16向量化版本)
-- [X] elementwise_add_f16x8_kernel(fp16向量化版本)
-- [X] elementwise_add_f16x8_pack_kernel(fp16向量化版本, pack)
-- [X] PyTorch bindings
-
+- [X]  elementwise_add_f32_kernel
+- [X]  elementwise_add_f32x4_kernel(float4向量化版本)
+- [X]  elementwise_add_f16_kernel(fp16版本)
+- [X]  elementwise_add_f16x2_kernel(fp16向量化版本)
+- [X]  elementwise_add_f16x8_kernel(fp16向量化版本)
+- [X]  elementwise_add_f16x8_pack_kernel(fp16向量化版本, pack)
+- [X]  PyTorch bindings
 
 ## 测试
 
 ```bash
 # 只测试Ada架构 不指定默认编译所有架构 耗时较长: Volta, Ampere, Ada, Hopper, ...
-export TORCH_CUDA_ARCH_LIST=Ada
+export TORCH_CUDA_ARCH_LIST=Blackwell
 python3 elementwise.py
 ```
 
