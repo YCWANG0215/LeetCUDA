@@ -19,11 +19,19 @@
 
 // FP32
 // DS required for Online Softmax
+// Align8：让MD对齐到8字节，提高访存效率
 struct __align__(8) MD {
+  // 存储当前warp或block里处理元素的最大值
   float m;
+  // 存储对应的归一化分母的累积值
   float d;
 };
+
 // Warp Reduce for Online Softmax
+/**
+ * Online Softmax：
+ *    d = d_max + d_min * exp(m_min - m_max)
+ */
 template <const int kWarpSize = WARP_SIZE>
 __device__ __forceinline__ MD warp_reduce_md_op(MD value) {
   unsigned int mask = 0xffffffff;
@@ -44,6 +52,19 @@ __device__ __forceinline__ MD warp_reduce_md_op(MD value) {
 }
 
 // Warp Reduce Sum
+/**
+ * __shfl_xor_sync：在warp内，每个线程将自己的val与另一个线程的val做异或交换，再加起来
+ *    param1：活跃线程掩码，0xffffffff表示warp内所有线程参与
+ *    param2：当前线程的值
+ *    param3：决定和warp内哪个线程交换数据，使用XOR规则
+ * 每次循环，参与的线程对半归约（pairwise reduction）
+ * 循环结束后，warp leader（线程lane 0）持有整个warp的和
+ * 返回值：每个线程返回的val都是归约的结果。通常只有lane 0的线程有意义，其他线程的val也会被更新，
+ *        但如果需要所有线程都有总和，需要再做广播
+ * warp shufful指令不需要访问共享内存。
+ * 适合作为block-level reduction的第一步：先warp内归约，再把warp的结果写会共享内存，
+ * warp leader再归约warp之间的和。
+ */
 template <const int kWarpSize = WARP_SIZE>
 __device__ __forceinline__ float warp_reduce_sum_f32(float val) {
 #pragma unroll
@@ -76,9 +97,13 @@ __device__ float block_reduce_sum_f32(float val) {
   if (lane == 0)
     shared[warp] = value;
   __syncthreads();
+  // shared[0...NUM_WARP-1]存储了每个warp的归约结果，接下来再用一个warp归约这些warp的总和
+  // pertoken的softmax一个Block负责一个token的所有元素，那么最终需要每个线程都能拿到整个token的max或sum
+  // 也就是说，reduce出来的结果不是只给一个线程用，而是要给Block内是所有线程用
   value = (lane < NUM_WARPS) ? shared[lane] : 0.0f;
   value = warp_reduce_sum_f32<NUM_WARPS>(value);
   // WRAN: need to broadcast value to all threads within warp
+  // 在warp内广播lane0的值到所有线程
   value = __shfl_sync(0xffffffff, value, 0, 32);
   return value;
 }
@@ -171,6 +196,15 @@ __global__ void softmax_f32_per_token_kernel(float *x, float *y, int N) {
     y[idx] = exp_val / exp_sum;
 }
 
+template <const int NUM_THREADS = 256>
+__global__ void softmax_f32_per_token_kernel_(float *x, float *y, int N) {
+  const int tid = threadIdx.x;
+  const int idx = blockIdx.x * blockDim.x + tid;
+
+  float exp_val = (idx < N) ? expf(x[idx]) : 0.0f;
+  float exp_sum = block_reduce_sum_f32<NUM_THREAD>(exp_val);
+}
+
 template <const int NUM_THREADS = 256 / 4>
 __global__ void softmax_f32x4_per_token_kernel(float *x, float *y, int N) {
   const int tid = threadIdx.x;
@@ -256,6 +290,7 @@ __global__ void safe_softmax_f16_f32_per_token_kernel(half *x, half *y, int N) {
   float exp_val = (idx < N) ? expf(val - max_val) : 0.0f;
   float exp_sum = block_reduce_sum_f32<NUM_THREADS>(exp_val); // block sum
   // e^x_i/sum(e^x_0,...,e^x_n-1)
+  // rn：round to nearest，即四舍五入
   if (idx < N)
     y[idx] = __float2half_rn(exp_val / exp_sum);
 }
@@ -841,4 +876,314 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   TORCH_BINDING_COMMON_EXTENSION(safe_softmax_f16x8_pack_f32_per_token)
   TORCH_BINDING_COMMON_EXTENSION(online_safe_softmax_f32_per_token)
   TORCH_BINDING_COMMON_EXTENSION(online_safe_softmax_f32x4_pack_per_token)
+}
+
+
+/**
+ * Self Version
+ * softmax: e^{xi} / sigma(e^{xi})
+ */
+template<const int kWarpSize = WARP_SIZE>
+__device__ __forceinline__ MD warp_reduce_md_op(MD value) {
+  unsigned int mask = 0xffffffff;
+#pragma unroll
+  for (int stride = WARP_SIZE; stride >= 1; stride >>= 1) {
+    MD other;
+    other.m = __shfl_xor_sync(mask, value.m, stride);
+    other.d = __shfl_xor_sync(mask, value.d, stride);
+
+    bool value_bigger = (value.m > other.m);
+    MD bigger_m = (value_bigger) ? value : other;
+    MD smaller_m = (value_bigger) ? other : value;
+
+    value.d = bigger_m.d + smaller_m.d * __expf(smaller_m.m - bigger_m.m);
+    value.m = bigger_m.m;
+  }
+
+  return value;
+}
+
+template<const int kWarpSize = WARP_SIZE>
+__device__ __forceinline__ float warp_reduce_sum_f32(float val) {
+#pragma unroll
+  for (int mask = kWarpSize >> 1; mask >= 1; mask >>= 1) {
+    val += __shfl_xor_sync(0xffffffff, val, mask);
+  }
+
+  return val;
+}
+
+template<const int kWarpSize = WARP_SIZE>
+__device__ __forceinline__ float warp_reduce_max_f32(float val) {
+#pragma unroll
+  for (int mask = kWarpSize >> 1; mask >= 1; mask >>= 1) {
+    val = fmaxf(val, __shfl_xor_sync(0xffffffff, val, mask));
+  }
+
+  return val;
+}
+
+template<const int NUM_THREADS = 256>
+__device__ __forceinline__ float block_reduce_sum_f32(float val) {
+  constexpr int NUM_WARPS = (NUM_THREADS + WARP_SIZE - 1) / WARP_SIZE;
+  int warp = threadIdx.x / WARP_SIZE;
+  int lane = threadIdx.x % WARP_SIZE;
+  static __shared__ float shared[NUM_WARPS];
+
+  float value = warp_reduce_sum_f32<NUM_WARPS>(val);
+  if (lane == 0) {
+    shared[warp] = value;
+  }
+  __syncthreads();
+
+  value = (lane < NUM_WARPS) ? shared[lane] : 0.0f;
+  value = warp_reduce_sum_f32<NUM_WARPS>(value);
+  value = __shfl_sync(0xffffffff, value, 0, 32);
+  
+  return value;
+}
+
+template<const int NUM_THREADS = 256>
+__device__ __forceinline__ float block_reduce_max_f32(float val) {
+  constexpr int NUM_WARPS = (NUM_THREADS + WARP_SIZE - 1) / WARP_SIZE;
+  int warp = threadIdx.x / WARP_SIZE;
+  int lane = threadIdx.x % WARP_SIZE;
+  static __shared__ shared[NUM_WARPS];
+
+  float value = warp_reduce_max_f32<NUM_WARPS>(val);
+  if (lane == 0) {
+    shared[warp] = value;
+  }
+  __syncthreads();
+
+  value = (lane < NUM_WARPS) ? shared[lane] : -FLT_MAX;
+  value = warp_reduce_max_f32<NUM_WARPS>(value);
+  value = __shfl_sync(0xffffffff, value, 0, 32);
+
+  return value;
+}
+
+template<const int NUM_THREAD = 256>
+__global__ void softmax_f32_per_token_kernel(float *a, float *b, int N) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  float exp_val = (idx < N) ? expf(a[idx]) : 0.0f;
+  float exp_sum = block_reduce_sum_f32<NUM_THREAD>(exp_val);
+}
+
+template<const int NUM_THREADS = 256>
+__global__ void softmax_f32x4_per_token_kernel(float *a, float *b, int N) {
+  int idx = (blockIdx.x * blockDim.x + threadIdx.x) * 4;
+  float4 reg_a = reinterpret_cast<float4 *>(&a[idx])[0];
+  float4 reg_exp;
+  reg_exp.x = (idx + 0 < N) ? expf(reg_a.x) : 0.0f;
+  reg_exp.y = (idx + 1 < N) ? expf(reg_a.y) : 0.0f;
+  reg_exp.z = (idx + 2 < N) ? expf(reg_a.z) : 0.0f;
+  reg_exp.w = (idx + 3 < N) ? expf(reg_a.w) : 0.0f;
+
+  float exp_val = reg_exp.x + reg_exp.y + reg_exp.z + reg_exp.w;
+  float exp_sum = block_reduce_sum_f32<NUM_THREADS>(exp_val);
+
+  if (idx + 3 < N) {
+    float4 reg_b;
+    reg_b.x = reg_exp.x / exp_sum;
+    reg_b.y = reg_exp.y / exp_sum;
+    reg_b.z = reg_exp.z / exp_sum;
+    reg_b.w = reg_exp.w / exp_sum;
+    reinterpret_cast<float4 *>(&b[idx])[0] = reg_b;
+  }
+}
+
+template<const int NUM_THREADS = 256>
+__global__ void safe_softmax_f32_per_token_kernel(float *a, float *b, int N) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  float val = (idx < N) ? a[idx] : -FLT_MAX;
+  float val_max = block_reduce_sum_f32<NUM_THREADS>(val);
+  float exp_val = (idx < N) ? expf(val - val_max) : 0.0f;
+  float exp_sum = block_reduce_sum_f32<NUM_THREADS>(exp_val);
+  if (idx < N) {
+    b[idx] = exp_val / exp_sum;
+  }
+}
+
+template<const int NUM_THREADS = 256>
+__global__ void safe_soft_max_f32x4_per_token_kernel(float *a, float *b, int N) {
+  int idx = (blockIdx.x * blockDim.x + threadIdx.x) * 4;
+  float4 reg_a = reinterpret_cast<float4 *>(&a[idx])[0];
+  reg_a.x = (idx + 0 < N) ? reg_x.x : -FLT_MAX;
+  reg_a.y = (idx + 1 < N) ? reg_x.y : -FLT_MAX;
+  reg_a.z = (idx + 2 < N) ? reg_x.z : -FLT_MAX;
+  reg_a.w = (idx + 3 < N) ? reg_x.w : -FLT_MAX;
+  float val = reg_a.x;
+  val = fmaxf(val, reg_a.y);
+  val = fmaxf(val, reg_a.z);
+  val = fmaxf(val, reg_a.w);
+
+  float val_max = block_reduce_max_f32<NUM_THREADS>(val);
+  float4 reg_exp;
+  reg_exp.x = (idx + 0 < N) ? expf(reg_a.x - val_max) : 0.0f;
+  reg_exp.y = (idx + 1 < N) ? expf(reg_a.y - val_max) : 0.0f;
+  reg_exp.z = (idx + 2 < N) ? expf(reg_a.z - val_max) : 0.0f;
+  reg_exp.w = (idx + 3 < N) ? expf(reg_a.w - val_max) : 0.0f;
+
+  float exp_val = reg_exp.x + reg_exp.t + reg_exp.z + reg_exp.w;
+  float exp_sum = block_reduce_sum_f32(exp_val);
+  
+  if (idx + 3 < N) {
+    float4 reg_b;
+    reg_b.x = reg_exp.x / exp_sum;
+    reg_b.y = reg_exp.y / exp_sum;
+    reg_b.z = reg_exp.z / exp_sum;
+    reg_b.w = reg_exp.w / exp_sum;
+    reinterpret_cast<float4 *>(&b[idx])[0] = reg_b;
+  }
+}
+
+template<const int NUM_THREADS = 256>
+__global__ void safe_softmax_f16_f32_per_token_kernel(half *a, half *b, int N) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  float val = (idx < N) ? __half2float(a[idx]) : -FLT_MAX;
+  float val_max = block_reduce_max_f32<NUM_THREADS>(val);
+  float exp_val = (idx < N) ? expf(val - val_max) : 0.0f;
+  float exp_sum = block_reduce_sum_f32<NUM_THREADS>(exp_val);
+
+  if (idx < N) {
+    b[idx] = __float2half_rn(exp_val / exp_sum);
+  }
+}
+
+template<const int NUM_THREADS = 256>
+__global__ void safe_softmax_f16x2_f32_per_token_kernel(half *a, half *b, int N) {
+  int idx = (blockDim.x * blockIdx.x + threadIdx.x) * 2;
+  float2 reg_a = __half22float(reinterpret_cast<half2 *>(&a[idx])[0]);
+  // half2 h2 = reinterpret_cast<half2 *>(&a[idx])[0];
+  // float2 reg_a;
+  // reg_a.x = __half2float(h2.x);
+  // reg_a.y = __half2float(h2.y);
+  float max_val = -FLT_MAX;
+  max_val = (idx + 0 < N) ? fmaxf(max_val, reg_a.x) : -FLT_MAX;
+  max_val = (idx + 1 < N) ? fmaxf(max_val, reg_a.y) : -FIT_MAX;
+  max_val = block_reduce_max_f32<NUM_THREADS>(max_val);
+
+  float2 reg_exp;
+  reg_exp.x = (idx + 0 < N) ? expf(reg_a.x - max_val) : 0.0f;
+  reg_exp.y = (idx + 1 < N) ? expf(reg_a.y - max_val) : 0.0f;
+
+  float exp_val = reg_exp.x + reg_exp.y;
+  float exp_sum = block_reduce_sum_f32<NUM_THREADS>(exp_val);
+
+  float2 reg_b;
+  reg_b.x = (idx < N) ? reg_exp.x / exp_sum;
+  reg_b.y = (idx < N) ? reg_exp.y / exp_sum;
+
+  if (idx + 1 < N) {
+    reinterpret_cast<half2 *>(&b[idx])[0] = __float22half2_rn(reg_b);
+  }
+}
+
+
+template<const int NUM_THREADS = 256>
+__global__ void safe_softmax_f16x8_pack_f32_per_token_kernel(half *a, half *b, int N) {
+  int idx = (threadIdx.x + blockIdx.x * blockDim.x) * 8;
+  half pack_x[8], pack_y[8];
+  LDST128BITS(pack_x[0]) = LDST128BITS(a[idx]);
+  float max_val = -FLT_MAX;
+
+#pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    max_val = fmaxf(max_val, __half2float(pack_x[i]));
+  }
+  max_val = block_reduce_sum_f32<NUM_THREADS>(max_val);
+  
+  float exp_sum = 0.0f;
+#pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    exp_sum += ((idx + i < N) ? expf(pack_x[i] - max_val)) : 0.0f;
+  }
+  block_reduce_sum_f32<NUM_THREADS>(exp_sum);
+
+#pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    float exp_val = expf(__half2float(pack_x[i]) - max_val);
+    pack_y[i] = (__float2half_rn)(exp_val / exp_sum);
+  }
+
+  if (idx + 7 < N) {
+    LDST128BITS(b[idx]) = LDST128BITS(pack_y[0]);
+  }
+}
+
+template<const int NUM_THREADS = 256>
+__global__ void online_safe_softmax_f32_per_token_kernel(float *a, float *b, int N) {
+  int tid = threadIdx.x;
+  int idx = blockIdx.x * NUM_THREADS + tid;
+  int NUM_WARPS = NUM_THREADS / WARP_SIZE;
+  int warp_id = tid / WARP_SIZE;
+  int lane_id = tid % WARP_SIZE;
+
+  MD val;
+  val.m = (idx < N) ? a[idx] : -FLT_MAX;
+  val.d = (idx < N) ? 1.0f : 0.0f;
+  __shared__ MD shared[NUM_WARPS];
+
+  MD res = warp_reduce_md_op<WARP_SIZE>(val);
+  if (lane_id == 0) {
+    shared[warp_id] = res;
+  }
+  __syncthreads();
+
+  if (tid < WARP_SIZE) {
+    MD block_res = shared[tid];
+    block_res = warp_reduce_md_op<WARP_SIZE>(block_res);
+    if (tid == 0) {
+      shared[0] = block_res;
+    }
+  }
+  __syncthreads();
+
+  MD final_res = shared[0];
+  float d_total_inverse = __fdividef(1.0f, final_res.d);
+  if (idx < N) {
+    b[idx] = __expf(a[idx] - final_res.m) * d_total_inverse;
+  }
+}
+
+template<const int NUM_THREADS = 256 / 4>
+__global__ void online_safe_softmax_f32x4_pack_per_token_kernel(float *a, float *b, int N) {
+  int tid = threadIdx.x;
+  int idx = blockIdx.x * NUM_THREADS + threadIdx.x;
+  const int WARP_NUM = NUM_THREADS / WARP_SIZE;
+  int warp_id = tid / WARP_SIZE;
+  int lane_id = tid % WARP_SIZE;
+  float4 val = reinterpret_cast<float *>(&x[idx])[0];
+  float local_m = fmaxf(fmaxf(val.x, val.y), fmaxf(val.z, val.w));
+  float local_d = __expf(val.x - local_m) + __expf(val.y - local_m) + __expf(val.z - local_m) + __expf(val.w - local_m);
+  MD local_md = {local_m, local_d};
+  MD res = warp_reduce_md_op<WARP_SIZE>(local_md);
+  __shared__ MD shared[WARP_NUM];
+
+  if (lane_id == 0) {
+    shared[warp_id] = res;
+  }
+  __syncthreads();
+
+  if (tid < WARP_SIZE) {
+    MD block_res = shared[tid];
+    block_res = warp_reduce_md_op<WARP_NUM>(block_res);
+    if (tid == 0) {
+      shared[0] = block_res;
+    }
+  }
+  __syncthreads();
+
+  MD final_res = shared[0];
+  float d_total_inverse = __fdividef(1.0f, final_res.d);
+  if (idx < N) {
+    float4 reg_b;
+    reg_b.x = __expf(val.x - final_res.m) * d_total_inverse;
+    reg_b.y = __expf(val.y - final_res.m) * d_total_inverse;
+    reg_b.z = __expf(val.z - final_res.m) * d_total_inverse;
+    reg_b.w = __expf(val.w - final_res.m) * d_total_inverse;
+    reinterpret_cast<float4 *>(&b[idx])[0] = reg_b;
+  }
+
 }

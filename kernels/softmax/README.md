@@ -4,23 +4,22 @@
 
 包含以下内容：
 
-- [X] softmax_f32_per_token_kernel(per token)
-- [X] softmax_f32x4_per_token_kernel(per token)
-- [X] safe_softmax_f32_per_token_kernel(per token)
-- [X] safe_softmax_f32x4_per_token_kernel(per token)
-- [X] safe_softmax_f16_f32_per_token_kernel(per token)
-- [X] safe_softmax_f16x2_f32_per_token_kernel(per token)
-- [X] safe_softmax_f16x8_pack_f32_per_token_kernel(per token)
-- [X] online_safe_softmax_f32_per_token_kernel(per token, online softmax)
-- [X] online_safe_softmax_f32x4_pack_per_token_kernel(per token, online softmax)
-- [X] PyTorch bindings
-
+- [X]  softmax_f32_per_token_kernel(per token)
+- [X]  softmax_f32x4_per_token_kernel(per token)
+- [X]  safe_softmax_f32_per_token_kernel(per token)
+- [X]  safe_softmax_f32x4_per_token_kernel(per token)
+- [X]  safe_softmax_f16_f32_per_token_kernel(per token)
+- [X]  safe_softmax_f16x2_f32_per_token_kernel(per token)
+- [X]  safe_softmax_f16x8_pack_f32_per_token_kernel(per token)
+- [X]  online_safe_softmax_f32_per_token_kernel(per token, online softmax)
+- [X]  online_safe_softmax_f32x4_pack_per_token_kernel(per token, online softmax)
+- [X]  PyTorch bindings
 
 ## 测试
 
 ```bash
 # 只测试Ada架构 不指定默认编译所有架构 耗时较长: Volta, Ampere, Ada, Hopper, ...
-export TORCH_CUDA_ARCH_LIST=Ada
+export TORCH_CUDA_ARCH_LIST=Blackwell
 python3 softmax.py
 ```
 
